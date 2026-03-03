@@ -13,11 +13,12 @@ CT疾病分类 Skill（Mock实现）
      - ONNX模型：onnxruntime.InferenceSession('ct_classifier.onnx')
 """
 
+import json
 import logging
 import random
 from pathlib import Path
 
-from langchain.tools import tool
+from langchain_core.tools import tool
 
 logger = logging.getLogger(__name__)
 
@@ -91,13 +92,6 @@ def classify_ct(image_path: str) -> dict:
         - model_version: 模型版本（str）
         - image_path: 输入图片路径（str）
         - is_mock: 是否为mock结果（bool）
-
-    替换为真实模型的步骤：
-        1. 加载预训练模型：model = load_model('path/to/model.pth')
-        2. 预处理图片：img_tensor = preprocess(image_path)
-        3. 推理：with torch.no_grad(): output = model(img_tensor)
-        4. 后处理：probs = torch.softmax(output, dim=1)
-        5. 返回格式化结果
     """
     logger.info("开始CT分类，图片路径: %s", image_path)
 
@@ -106,41 +100,29 @@ def classify_ct(image_path: str) -> dict:
     if not path.exists():
         logger.warning("图片文件不存在: %s，使用mock数据", image_path)
 
-    # ── 真实模型接口预留 ──────────────────────────
-    # TODO: 取消下面注释以启用真实模型
-    # from app.skills._real_models import load_ct_classifier
-    # model = load_ct_classifier()
-    # result = model.predict(image_path)
-    # return result
-    # ─────────────────────────────────────────────
-
     result = _mock_classify(image_path)
     logger.info("CT分类完成: %s (置信度: %.2f%%)", result["disease_type"], result["confidence"] * 100)
     return result
 
 
 # ─────────────────────────────────────────
-# LangChain Tool 注册
+# LangChain Tool 注册（标准化封装）
 # ─────────────────────────────────────────
 
 @tool
-def ct_classification_tool(image_path: str) -> str:
-    """
-    CT疾病分类工具（LangChain Tool）
+def analyze_ct_tool(image_path: str) -> str:
+    """CT疾病分类诊断工具。
 
-    对给定的CT图片进行疾病分类分析，返回疾病类型和置信度。
+    当你拿到了病人的CT图片路径，需要判断这张CT片子里有没有肺炎、肺结节、
+    肺癌、肺气肿、胸腔积液等病变时，就必须调用这个工具。
+    它会返回一个JSON，里面包含疾病分类类型、置信度和各类别概率分布。
 
     参数:
-        image_path: CT图片文件路径
-
-    返回:
-        包含分类结果的格式化字符串
+        image_path: CT图片在本地磁盘上的文件路径，比如 /tmp/ct_scan.jpg
     """
     result = classify_ct(image_path)
-    return (
-        f"CT分类结果:\n"
-        f"- 疾病类型: {result['disease_type']}\n"
-        f"- 置信度: {result['confidence']:.1%}\n"
-        f"- 模型版本: {result['model_version']}\n"
-        f"- 所有类别概率: {result['all_probabilities']}"
-    )
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+# 保留旧名称兼容（别名）
+ct_classification_tool = analyze_ct_tool

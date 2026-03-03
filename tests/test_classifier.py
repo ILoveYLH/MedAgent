@@ -8,6 +8,7 @@ import pytest
 from app.skills.ct_classifier import (
     DISEASE_CLASSES,
     classify_ct,
+    analyze_ct_tool,
     ct_classification_tool,
 )
 

@@ -1,260 +1,266 @@
 """
 主Agent调度器
 
-使用 LangGraph 构建有状态的医学CT诊断Agent工作流。
-工作流步骤：
-  1. 接收用户输入（CT图片路径 + 文本请求）
-  2. 意图识别
-  3. CT疾病分类
-  4. 病灶检测
-  5. RAG知识库检索
-  6. 诊断报告生成
-  7. 返回综合结果
+使用 LangGraph 构建医学CT诊断Agent。
+
+Phase 1: 单体 ReACT Agent (create_react_agent)
+Phase 2: + MemorySaver 多轮对话记忆
+Phase 3: 多专家 Supervisor 架构
 """
 
+import json
 import logging
-from datetime import datetime
-from typing import Any, TypedDict
+from typing import Any, Optional
 
-from langgraph.graph import END, StateGraph
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langgraph.prebuilt import create_react_agent
 
-from app.agent.prompts import (
-    INTENT_RECOGNITION_PROMPT,
-    KNOWLEDGE_QUERY_PROMPT,
-    REPORT_GENERATION_PROMPT,
-)
+from app.agent.prompts import REACT_SYSTEM_PROMPT
 from app.config import settings
-from app.skills.ct_classifier import classify_ct
-from app.skills.lesion_detector import detect_lesions
+from app.skills.ct_classifier import analyze_ct_tool
+from app.skills.lesion_detector import detect_lesion_tool
+from app.skills.medical_knowledge_tool import query_medical_knowledge_tool
 
 logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────
-# 工作流状态定义
+# 工具列表
 # ─────────────────────────────────────────
-class AgentState(TypedDict):
-    """Agent工作流状态，贯穿整个处理流程"""
 
-    # 输入
-    image_path: str          # CT图片路径
-    user_request: str        # 用户文本请求
-
-    # 中间状态
-    intents: list[str]       # 识别到的意图列表
-    classification_result: dict[str, Any]   # CT分类结果
-    detection_result: dict[str, Any]        # 病灶检测结果
-    rag_knowledge: list[str]                # RAG检索结果
-
-    # 输出
-    report: str              # 最终诊断报告
-    error: str               # 错误信息（如有）
+TOOLS = [analyze_ct_tool, detect_lesion_tool, query_medical_knowledge_tool]
 
 
 # ─────────────────────────────────────────
-# 工作流节点函数
+# LLM 实例（懒加载）
 # ─────────────────────────────────────────
 
-DEFAULT_INTENTS = ["classification", "detection", "report"]
+_llm = None
 
 
-def recognize_intent(state: AgentState) -> AgentState:
-    """
-    节点1：意图识别
-    判断用户需要分类、检测、报告还是知识查询
-    """
-    try:
-        # 尝试使用 Gemini 进行意图识别
-        if settings.google_api_key:
-            import google.generativeai as genai
-            genai.configure(api_key=settings.google_api_key)
-            model = genai.GenerativeModel(settings.model_name)
-            prompt = INTENT_RECOGNITION_PROMPT.format(user_request=state["user_request"])
-            response = model.generate_content(prompt)
-            raw = response.text.strip().lower()
-            intents = [i.strip() for i in raw.split(",") if i.strip()]
-        else:
-            # 无API Key时默认执行全流程
-            intents = list(DEFAULT_INTENTS)
-
-        # 确保至少有一个意图
-        if not intents:
-            intents = list(DEFAULT_INTENTS)
-
-        logger.info("识别到的用户意图: %s", intents)
-        return {**state, "intents": intents}
-    except Exception as exc:
-        logger.warning("意图识别失败，使用默认全流程: %s", exc)
-        return {**state, "intents": list(DEFAULT_INTENTS)}
-
-
-def run_classification(state: AgentState) -> AgentState:
-    """
-    节点2：CT疾病分类
-    调用 ct_classifier skill 获取疾病分类结果
-    """
-    try:
-        result = classify_ct(state["image_path"])
-        logger.info("CT分类完成: %s", result.get("disease_type"))
-        return {**state, "classification_result": result}
-    except Exception as exc:
-        logger.error("CT分类失败: %s", exc)
-        return {**state, "classification_result": {"error": str(exc)}}
-
-
-def run_detection(state: AgentState) -> AgentState:
-    """
-    节点3：病灶检测
-    调用 lesion_detector skill 获取病灶检测结果
-    """
-    try:
-        result = detect_lesions(state["image_path"])
-        logger.info("病灶检测完成，发现 %d 处病灶", len(result.get("lesions", [])))
-        return {**state, "detection_result": result}
-    except Exception as exc:
-        logger.error("病灶检测失败: %s", exc)
-        return {**state, "detection_result": {"error": str(exc)}}
-
-
-def query_knowledge(state: AgentState) -> AgentState:
-    """
-    节点4：RAG知识库检索
-    根据分类和检测结果检索相关医学知识
-    """
-    try:
-        from app.rag.knowledge_base import query_knowledge as kb_query
-
-        cls = state.get("classification_result", {})
-        det = state.get("detection_result", {})
-        disease_type = cls.get("disease_type", "未知疾病")
-        lesion_count = len(det.get("lesions", []))
-        lesion_info = f"发现 {lesion_count} 处病灶" if lesion_count else "未发现明显病灶"
-
-        # 构建查询语句
-        if settings.google_api_key:
-            import google.generativeai as genai
-            genai.configure(api_key=settings.google_api_key)
-            model = genai.GenerativeModel(settings.model_name)
-            prompt = KNOWLEDGE_QUERY_PROMPT.format(
-                disease_type=disease_type,
-                lesion_info=lesion_info,
-            )
-            query = model.generate_content(prompt).text.strip()
-        else:
-            query = disease_type
-
-        knowledge_chunks = kb_query(query, top_k=settings.rag_top_k)
-        logger.info("RAG检索完成，获取 %d 条知识", len(knowledge_chunks))
-        return {**state, "rag_knowledge": knowledge_chunks}
-    except Exception as exc:
-        logger.warning("RAG检索失败，跳过: %s", exc)
-        return {**state, "rag_knowledge": []}
-
-
-def generate_report(state: AgentState) -> AgentState:
-    """
-    节点5：诊断报告生成
-    整合所有分析结果，调用 Gemini 生成结构化诊断报告
-    """
-    try:
-        from app.report.generator import generate_diagnosis_report
-
-        report = generate_diagnosis_report(
-            user_request=state["user_request"],
-            classification_result=state.get("classification_result", {}),
-            detection_result=state.get("detection_result", {}),
-            rag_knowledge=state.get("rag_knowledge", []),
+def _get_llm() -> ChatGoogleGenerativeAI:
+    """获取全局 LLM 实例"""
+    global _llm
+    if _llm is None:
+        _llm = ChatGoogleGenerativeAI(
+            model=settings.model_name,
+            google_api_key=settings.google_api_key,
+            temperature=0.3,
         )
-        logger.info("诊断报告生成完成")
-        return {**state, "report": report}
-    except Exception as exc:
-        logger.error("报告生成失败: %s", exc)
-        # 降级：返回简单摘要
-        cls = state.get("classification_result", {})
-        det = state.get("detection_result", {})
-        fallback = (
-            f"## CT诊断摘要\n\n"
-            f"**疾病分类**: {cls.get('disease_type', '未知')} "
-            f"（置信度: {cls.get('confidence', 0):.1%}）\n\n"
-            f"**病灶数量**: {len(det.get('lesions', []))} 处\n\n"
-            f"*报告生成失败，请检查API配置。错误: {exc}*"
+    return _llm
+
+
+# ─────────────────────────────────────────
+# Phase 1: 单体 ReACT Agent
+# ─────────────────────────────────────────
+
+_react_agent = None
+
+
+def _get_react_agent():
+    """获取全局 ReACT Agent 实例（无 Memory）"""
+    global _react_agent
+    if _react_agent is None:
+        llm = _get_llm()
+        _react_agent = create_react_agent(
+            model=llm,
+            tools=TOOLS,
+            prompt=REACT_SYSTEM_PROMPT,
         )
-        return {**state, "report": fallback}
-
-
-# ─────────────────────────────────────────
-# 构建 LangGraph 工作流
-# ─────────────────────────────────────────
-
-def build_agent_graph() -> StateGraph:
-    """构建并返回编译好的 LangGraph Agent工作流"""
-
-    workflow = StateGraph(AgentState)
-
-    # 注册节点
-    workflow.add_node("recognize_intent", recognize_intent)
-    workflow.add_node("run_classification", run_classification)
-    workflow.add_node("run_detection", run_detection)
-    workflow.add_node("query_knowledge", query_knowledge)
-    workflow.add_node("generate_report", generate_report)
-
-    # 设置入口节点
-    workflow.set_entry_point("recognize_intent")
-
-    # 定义边（顺序执行）
-    workflow.add_edge("recognize_intent", "run_classification")
-    workflow.add_edge("run_classification", "run_detection")
-    workflow.add_edge("run_detection", "query_knowledge")
-    workflow.add_edge("query_knowledge", "generate_report")
-    workflow.add_edge("generate_report", END)
-
-    return workflow.compile()
-
-
-# 全局编译好的工作流实例（懒加载）
-_agent_graph = None
-
-
-def get_agent_graph():
-    """获取全局Agent工作流实例（懒加载）"""
-    global _agent_graph
-    if _agent_graph is None:
-        _agent_graph = build_agent_graph()
-    return _agent_graph
+    return _react_agent
 
 
 def run_agent(image_path: str, user_request: str) -> dict[str, Any]:
     """
-    运行完整的CT诊断Agent工作流
+    运行 ReACT Agent 进行 CT 诊断（Phase 1，无记忆）
 
     参数:
         image_path: CT图片路径
         user_request: 用户文本请求
 
     返回:
-        包含分类结果、检测结果、RAG知识和诊断报告的字典
+        包含诊断报告的字典
     """
-    graph = get_agent_graph()
+    agent = _get_react_agent()
 
-    # 初始化状态
-    initial_state: AgentState = {
-        "image_path": image_path,
-        "user_request": user_request,
-        "intents": [],
-        "classification_result": {},
-        "detection_result": {},
-        "rag_knowledge": [],
-        "report": "",
-        "error": "",
-    }
+    # 构建用户消息
+    message = f"{user_request}\n\nCT图片路径: {image_path}"
 
-    # 执行工作流
-    final_state = graph.invoke(initial_state)
+    logger.info("ReACT Agent 开始处理: %s", user_request[:50])
+
+    result = agent.invoke(
+        {"messages": [{"role": "user", "content": message}]}
+    )
+
+    # 提取最终回复
+    final_message = result["messages"][-1]
+    report = final_message.content if hasattr(final_message, "content") else str(final_message)
+
+    logger.info("ReACT Agent 处理完成")
 
     return {
-        "classification": final_state.get("classification_result", {}),
-        "detection": final_state.get("detection_result", {}),
-        "knowledge": final_state.get("rag_knowledge", []),
-        "report": final_state.get("report", ""),
-        "intents": final_state.get("intents", []),
+        "report": report,
+        "classification": {},
+        "detection": {},
+        "knowledge": [],
+        "intents": ["react_agent"],
     }
+
+
+# ─────────────────────────────────────────
+# Phase 2: 带记忆的 ReACT Agent
+# ─────────────────────────────────────────
+
+_memory_agent = None
+_memory_saver = None
+
+
+def _get_memory_agent():
+    """获取带 MemorySaver 的 ReACT Agent 实例"""
+    global _memory_agent, _memory_saver
+    if _memory_agent is None:
+        from langgraph.checkpoint.memory import MemorySaver
+        _memory_saver = MemorySaver()
+        llm = _get_llm()
+        _memory_agent = create_react_agent(
+            model=llm,
+            tools=TOOLS,
+            prompt=REACT_SYSTEM_PROMPT,
+            checkpointer=_memory_saver,
+        )
+    return _memory_agent
+
+
+def run_agent_with_memory(
+    message: str,
+    thread_id: str,
+    image_path: Optional[str] = None,
+) -> str:
+    """
+    运行带多轮记忆的 ReACT Agent（Phase 2）
+
+    参数:
+        message: 用户消息文本
+        thread_id: 会话线程ID（用于多轮记忆，如 Telegram User ID）
+        image_path: CT图片路径（可选）
+
+    返回:
+        Agent 最终回复文本
+    """
+    agent = _get_memory_agent()
+
+    # 构建用户消息
+    user_content = message
+    if image_path:
+        user_content = f"{message}\n\nCT图片路径: {image_path}"
+
+    logger.info("Memory Agent [thread=%s] 处理: %s", thread_id, message[:50])
+
+    result = agent.invoke(
+        {"messages": [{"role": "user", "content": user_content}]},
+        config={"configurable": {"thread_id": thread_id}},
+    )
+
+    # 提取最终回复
+    final_message = result["messages"][-1]
+    reply = final_message.content if hasattr(final_message, "content") else str(final_message)
+
+    logger.info("Memory Agent [thread=%s] 处理完成", thread_id)
+    return reply
+
+
+# ─────────────────────────────────────────
+# Phase 3: 多专家 Supervisor 架构
+# ─────────────────────────────────────────
+
+_supervisor_agent = None
+_supervisor_memory = None
+
+
+def _get_supervisor_agent():
+    """获取多专家 Supervisor Agent 实例"""
+    global _supervisor_agent, _supervisor_memory
+    if _supervisor_agent is None:
+        from langgraph.checkpoint.memory import MemorySaver
+        from langgraph_supervisor import create_supervisor
+
+        from app.agent.prompts import (
+            CLINICIAN_PROMPT,
+            RADIOLOGIST_PROMPT,
+            REVIEWER_PROMPT,
+            SUPERVISOR_PROMPT,
+        )
+
+        _supervisor_memory = MemorySaver()
+        llm = _get_llm()
+
+        # Agent A: 放射科医生 — 视觉分析专家
+        radiologist = create_react_agent(
+            model=llm,
+            tools=[analyze_ct_tool, detect_lesion_tool],
+            prompt=RADIOLOGIST_PROMPT,
+            name="radiologist",
+        )
+
+        # Agent B: 临床医生 — RAG 知识查阅
+        clinician = create_react_agent(
+            model=llm,
+            tools=[query_medical_knowledge_tool],
+            prompt=CLINICIAN_PROMPT,
+            name="clinician",
+        )
+
+        # Agent C: 主任审核员 — Reflection 交叉验证（无工具）
+        reviewer = create_react_agent(
+            model=llm,
+            tools=[],
+            prompt=REVIEWER_PROMPT,
+            name="reviewer",
+        )
+
+        # Supervisor 编排
+        _supervisor_agent = create_supervisor(
+            agents=[radiologist, clinician, reviewer],
+            model=llm,
+            prompt=SUPERVISOR_PROMPT,
+            checkpointer=_supervisor_memory,
+        ).compile()
+
+    return _supervisor_agent
+
+
+def run_supervisor_agent(
+    message: str,
+    thread_id: str,
+    image_path: Optional[str] = None,
+) -> str:
+    """
+    运行多专家 Supervisor Agent（Phase 3）
+
+    参数:
+        message: 用户消息文本
+        thread_id: 会话线程ID
+        image_path: CT图片路径（可选）
+
+    返回:
+        最终诊断报告文本
+    """
+    agent = _get_supervisor_agent()
+
+    user_content = message
+    if image_path:
+        user_content = f"{message}\n\nCT图片路径: {image_path}"
+
+    logger.info("Supervisor Agent [thread=%s] 开始会诊: %s", thread_id, message[:50])
+
+    result = agent.invoke(
+        {"messages": [{"role": "user", "content": user_content}]},
+        config={"configurable": {"thread_id": thread_id}},
+    )
+
+    # 提取最终回复
+    final_message = result["messages"][-1]
+    reply = final_message.content if hasattr(final_message, "content") else str(final_message)
+
+    logger.info("Supervisor Agent [thread=%s] 会诊完成", thread_id)
+    return reply

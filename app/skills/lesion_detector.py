@@ -13,12 +13,13 @@
      - nnU-Net：nnunet.inference.predictor.nnUNetPredictor(...)
 """
 
+import json
 import logging
 import random
 from pathlib import Path
 from typing import Any
 
-from langchain.tools import tool
+from langchain_core.tools import tool
 
 logger = logging.getLogger(__name__)
 
@@ -126,32 +127,12 @@ def detect_lesions(image_path: str) -> dict[str, Any]:
 
     返回:
         包含以下字段的字典：
-        - lesions: 病灶列表，每个病灶包含：
-            - lesion_id: 病灶编号
-            - type: 病灶类型
-            - bounding_box: 边界框坐标（x1, y1, x2, y2, width, height）
-            - size_mm: 等效直径（毫米）
-            - confidence: 检测置信度
-            - location: 病灶位置描述
-            - mask_path: 分割mask文件路径（None表示无mask）
+        - lesions: 病灶列表
         - total_count: 总病灶数量
         - image_size: 图像尺寸
         - model_version: 模型版本
         - image_path: 输入图片路径
         - is_mock: 是否为mock结果
-
-    替换为真实模型的步骤：
-        1. 加载预训练检测模型：model = YOLO('ct_lesion_detector.pt')
-        2. 推理：results = model.predict(image_path, conf=0.5)
-        3. 解析结果：boxes = results[0].boxes
-        4. 提取病灶信息：
-           for box in boxes:
-               lesion = {
-                   'bounding_box': box.xyxy[0].tolist(),
-                   'confidence': float(box.conf[0]),
-                   ...
-               }
-        5. 如有分割模型，生成mask文件并填写 mask_path
     """
     logger.info("开始病灶检测，图片路径: %s", image_path)
 
@@ -160,47 +141,29 @@ def detect_lesions(image_path: str) -> dict[str, Any]:
     if not path.exists():
         logger.warning("图片文件不存在: %s，使用mock数据", image_path)
 
-    # ── 真实模型接口预留 ──────────────────────────
-    # TODO: 取消下面注释以启用真实模型
-    # from app.skills._real_models import load_lesion_detector
-    # model = load_lesion_detector()
-    # result = model.predict(image_path)
-    # return result
-    # ─────────────────────────────────────────────
-
     result = _mock_detect(image_path)
     logger.info("病灶检测完成，发现 %d 处病灶", result["total_count"])
     return result
 
 
 # ─────────────────────────────────────────
-# LangChain Tool 注册
+# LangChain Tool 注册（标准化封装）
 # ─────────────────────────────────────────
 
 @tool
-def lesion_detection_tool(image_path: str) -> str:
-    """
-    CT病灶检测工具（LangChain Tool）
+def detect_lesion_tool(image_path: str) -> str:
+    """CT病灶检测工具。
 
-    对给定的CT图片进行病灶检测和分割分析，返回病灶位置、大小和类型信息。
+    当你需要在CT图片上找出病灶的具体位置、大小和类型时，必须调用这个工具。
+    比如要定位肺结节在哪里、有多大、是实性结节还是磨玻璃影，都靠它。
+    它返回一个JSON，包含每个病灶的坐标框(bounding_box)、类型、大小(mm)和置信度。
 
     参数:
-        image_path: CT图片文件路径
-
-    返回:
-        包含检测结果的格式化字符串
+        image_path: CT图片在本地磁盘上的文件路径，比如 /tmp/ct_scan.jpg
     """
     result = detect_lesions(image_path)
-    if result["total_count"] == 0:
-        return "病灶检测结果：未发现明显病灶"
+    return json.dumps(result, ensure_ascii=False, indent=2)
 
-    lines = [f"病灶检测结果：共发现 {result['total_count']} 处病灶\n"]
-    for lesion in result["lesions"]:
-        lines.append(
-            f"  病灶 {lesion['lesion_id']}:\n"
-            f"    - 类型: {lesion['type']}\n"
-            f"    - 位置: {lesion['location']}\n"
-            f"    - 大小: {lesion['size_mm']} mm\n"
-            f"    - 置信度: {lesion['confidence']:.1%}\n"
-        )
-    return "\n".join(lines)
+
+# 保留旧名称兼容（别名）
+lesion_detection_tool = detect_lesion_tool

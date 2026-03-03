@@ -8,6 +8,7 @@ import pytest
 from app.skills.lesion_detector import (
     LESION_TYPES,
     detect_lesions,
+    detect_lesion_tool,
     lesion_detection_tool,
 )
 

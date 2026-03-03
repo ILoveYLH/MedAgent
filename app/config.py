@@ -44,6 +44,9 @@ class Settings(BaseSettings):
     rag_top_k: int = Field(default=3, description="RAG检索返回的最大文档数")
     docs_dir: str = Field(default="./app/rag/docs", description="医学知识文档目录")
 
+    # Telegram Bot 配置
+    telegram_bot_token: str = Field(default="", description="Telegram Bot Token")
+
 
 # 全局配置实例
 settings = Settings()
