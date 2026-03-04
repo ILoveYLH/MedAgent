@@ -31,10 +31,11 @@ from dotenv import load_dotenv
 load_dotenv(os.path.join(_PROJECT_ROOT, ".env"))
 
 from web.agents.base import AgentStatus, BaseAgentOutput
+from web.agents.general_agent import GeneralAgent
 from web.executor import ParallelExecutor
 from web.rag_reducer import retrieve_medical_guidelines
 from web.report_stream import assemble_prompt, stream_report
-from web.router import ALL_AGENTS, route_input
+from web.router import ALL_AGENTS, SPECIALIST_AGENTS, route_input
 
 logger = logging.getLogger(__name__)
 
@@ -268,13 +269,14 @@ def render_agent_dashboard() -> None:
     )
 
     agent_info = {
+        "GeneralAgent": ("💬", "智能助手", "对话与导诊"),
         "ClinicalAgent": ("🩺", "临床诊断", "综合分析症状与病史"),
         "ImagingAgent": ("🔬", "影像分析", "CT / MRI 影像解读"),
         "BloodAgent": ("🩸", "血液分析", "血常规与肿瘤标志物"),
         "GeneticsAgent": ("🧬", "基因检测", "驱动突变与靶向药"),
     }
 
-    cols = st.columns(4)
+    cols = st.columns(5)
     for idx, (agent_name, (icon, label, desc)) in enumerate(agent_info.items()):
         status = st.session_state.agent_statuses.get(agent_name, AgentStatus.IDLE)
 
@@ -344,7 +346,7 @@ def render_chat() -> None:
         _handle_user_input(user_input, uploaded_file)
 
 
-def _handle_user_input(text: str, uploaded_file=None) -> None:
+def _handle_user_input(text: str, uploaded_file=None) -> None:  # noqa: C901
     """处理用户输入并触发诊疗流程"""
     # ── 1. 显示用户消息 ──
     st.session_state.messages.append({
@@ -367,111 +369,144 @@ def _handle_user_input(text: str, uploaded_file=None) -> None:
         if suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".dcm"}:
             image_path = tmp_path
 
-    # ── 3. 路由分发 ──
+    # ── 3. 路由分发（LLM 智能路由）──
     activated_agents = route_input(text, attachments)
 
     # ── 4. 初始化状态 ──
     for name in ALL_AGENTS:
-        st.session_state.agent_statuses[name] = (
-            AgentStatus.IDLE
-        )
+        st.session_state.agent_statuses[name] = AgentStatus.IDLE
 
-    # ── 5. 显示处理状态 ──
-    with st.chat_message("assistant", avatar="🏥"):
-        st.markdown(f"📡 **路由分析完成** — 已激活 **{len(activated_agents)}** 个专业 Agent：")
-        st.markdown("、".join(f"`{a}`" for a in activated_agents))
+    # ── 5. 判断走哪条路径 ──
+    is_general_only = (
+        len(activated_agents) == 1 and activated_agents[0] == "GeneralAgent"
+    )
 
-        # ── 6. 并行 Agent 处理 ──
-        st.markdown("---")
-        st.markdown("⚡ **多 Agent 并行处理中...**")
+    if is_general_only:
+        # ════════════════════════════════════
+        # 路径 A：通用对话（GeneralAgent）
+        # ════════════════════════════════════
+        st.session_state.agent_statuses["GeneralAgent"] = AgentStatus.RUNNING
 
-        # 创建 status containers 用于动态更新
-        status_containers = {}
-        status_cols = st.columns(len(activated_agents))
-        for idx, agent_name in enumerate(activated_agents):
-            with status_cols[idx]:
-                status_containers[agent_name] = st.status(
-                    f"⚡ 正在启动 {agent_name}...",
-                    expanded=True,
-                    state="running",
-                )
+        with st.chat_message("assistant", avatar="💬"):
+            general_agent = GeneralAgent()
+            patient_profile = st.session_state.patient_data.get("patient")
 
-        # 执行并行调度（不使用 callback，避免 st.session_state 线程安全问题）
-        executor = ParallelExecutor(max_workers=4)
-        input_data = {
-            "text": text,
-            "image_path": image_path,
-            "attachments": attachments,
-            "patient_profile": st.session_state.patient_data.get("patient"),
-        }
+            reply_placeholder = st.empty()
+            full_reply = ""
+            for chunk in general_agent.stream_reply(text, patient_profile):
+                full_reply += chunk
+                reply_placeholder.markdown(full_reply)
 
-        results = executor.run(
-            agent_names=activated_agents,
-            input_data=input_data,
-            status_callback=None,  # 不在线程中更新 session_state
-        )
+        st.session_state.agent_statuses["GeneralAgent"] = AgentStatus.SUCCESS
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": full_reply,
+            "avatar": "💬",
+        })
 
-        # ── 在主线程中安全地更新 session_state 和 UI ──
-        st.session_state.agent_results = results
-        for agent_name in activated_agents:
-            result = results.get(agent_name)
-            if result:
-                st.session_state.agent_statuses[agent_name] = result.status
-                container = status_containers.get(agent_name)
-                if container and result.status == AgentStatus.SUCCESS:
-                    container.update(
-                        label=f"✅ {result.agent_display_name or agent_name} — 完成 ({result.processing_time:.1f}s)",
-                        state="complete",
+    else:
+        # ════════════════════════════════════
+        # 路径 B：专业诊断流水线
+        # ════════════════════════════════════
+        # 过滤掉 GeneralAgent（不参与诊断流水线）
+        specialist_list = [a for a in activated_agents if a != "GeneralAgent"]
+
+        with st.chat_message("assistant", avatar="🏥"):
+            st.markdown(
+                f"📡 **智能路由完成** — 已激活 **{len(specialist_list)}** 个专业 Agent："
+            )
+            st.markdown("、".join(f"`{a}`" for a in specialist_list))
+
+            # ── 6. 并行 Agent 处理 ──
+            st.markdown("---")
+            st.markdown("⚡ **多 Agent 并行处理中...**")
+
+            status_containers = {}
+            status_cols = st.columns(len(specialist_list))
+            for idx, agent_name in enumerate(specialist_list):
+                with status_cols[idx]:
+                    status_containers[agent_name] = st.status(
+                        f"⚡ 正在启动 {agent_name}...",
+                        expanded=True,
+                        state="running",
                     )
-                    with container:
-                        for finding in result.findings[:3]:
-                            st.markdown(f"• {finding}")
-                        if result.abnormal_metrics:
-                            st.markdown(f"⚠️ 发现 **{len(result.abnormal_metrics)}** 项异常指标")
-                elif container and result.status == AgentStatus.FAILED:
-                    container.update(
-                        label=f"❌ {result.agent_display_name or agent_name} — 失败",
-                        state="error",
-                    )
-                    with container:
-                        st.error(result.error_message or "未知错误")
 
-        # ── 7. RAG 知识融合 ──
-        st.markdown("---")
-        st.markdown("📚 **正在检索医学知识库...**")
+            executor = ParallelExecutor(max_workers=4)
+            input_data = {
+                "text": text,
+                "image_path": image_path,
+                "attachments": attachments,
+                "patient_profile": st.session_state.patient_data.get("patient"),
+            }
 
-        guidelines = retrieve_medical_guidelines(
-            query=text,
-            agent_results=results,
-        )
-        st.markdown(f"✅ 匹配到 **{len(guidelines)}** 条相关指南")
+            results = executor.run(
+                agent_names=specialist_list,
+                input_data=input_data,
+                status_callback=None,
+            )
 
-        # ── 8. 流式报告生成 ──
-        st.markdown("---")
-        st.markdown("📝 **主治医师正在生成综合诊疗报告...**")
-        st.markdown("")
+            # ── 主线程更新 session_state 和 UI ──
+            st.session_state.agent_results = results
+            for agent_name in specialist_list:
+                result = results.get(agent_name)
+                if result:
+                    st.session_state.agent_statuses[agent_name] = result.status
+                    container = status_containers.get(agent_name)
+                    if container and result.status == AgentStatus.SUCCESS:
+                        container.update(
+                            label=f"✅ {result.agent_display_name or agent_name} — 完成 ({result.processing_time:.1f}s)",
+                            state="complete",
+                        )
+                        with container:
+                            for finding in result.findings[:3]:
+                                st.markdown(f"• {finding}")
+                            if result.abnormal_metrics:
+                                st.markdown(
+                                    f"⚠️ 发现 **{len(result.abnormal_metrics)}** 项异常指标"
+                                )
+                    elif container and result.status == AgentStatus.FAILED:
+                        container.update(
+                            label=f"❌ {result.agent_display_name or agent_name} — 失败",
+                            state="error",
+                        )
+                        with container:
+                            st.error(result.error_message or "未知错误")
 
-        patient_profile = st.session_state.patient_data.get("patient")
-        prompt = assemble_prompt(
-            user_query=text,
-            patient_profile=patient_profile,
-            agent_results=results,
-            rag_guidelines=guidelines,
-        )
+            # ── 7. RAG 知识融合 ──
+            st.markdown("---")
+            st.markdown("📚 **正在检索医学知识库...**")
 
-        # 流式输出
-        report_placeholder = st.empty()
-        full_report = ""
-        for chunk in stream_report(prompt):
-            full_report += chunk
-            report_placeholder.markdown(full_report)
+            guidelines = retrieve_medical_guidelines(
+                query=text,
+                agent_results=results,
+            )
+            st.markdown(f"✅ 匹配到 **{len(guidelines)}** 条相关指南")
 
-    # ── 9. 保存到消息历史 ──
-    st.session_state.messages.append({
-        "role": "assistant",
-        "content": full_report,
-        "avatar": "🏥",
-    })
+            # ── 8. 流式报告生成 ──
+            st.markdown("---")
+            st.markdown("📝 **主治医师正在生成综合诊疗报告...**")
+            st.markdown("")
+
+            patient_profile = st.session_state.patient_data.get("patient")
+            prompt = assemble_prompt(
+                user_query=text,
+                patient_profile=patient_profile,
+                agent_results=results,
+                rag_guidelines=guidelines,
+            )
+
+            report_placeholder = st.empty()
+            full_report = ""
+            for chunk in stream_report(prompt):
+                full_report += chunk
+                report_placeholder.markdown(full_report)
+
+        # ── 9. 保存到消息历史 ──
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": full_report,
+            "avatar": "🏥",
+        })
 
     # 清理临时文件
     for path in attachments:

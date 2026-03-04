@@ -14,6 +14,7 @@ from typing import Any, Callable, Optional
 from web.agents.base import AgentStatus, BaseAgentOutput
 from web.agents.blood_agent import BloodAgent
 from web.agents.clinical_agent import ClinicalAgent
+from web.agents.general_agent import GeneralAgent
 from web.agents.genetics_agent import GeneticsAgent
 from web.agents.imaging_agent import ImagingAgent
 
@@ -21,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 # ── Agent 注册表 ──
 AGENT_REGISTRY: dict[str, type] = {
+    "GeneralAgent": GeneralAgent,
     "ClinicalAgent": ClinicalAgent,
     "ImagingAgent": ImagingAgent,
     "BloodAgent": BloodAgent,
