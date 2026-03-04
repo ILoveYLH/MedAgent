@@ -2,17 +2,17 @@
 主Agent调度器
 
 使用 LangGraph 构建医学CT诊断Agent。
+支持多 LLM 提供商 (Google Gemini / 通义千问)，通过 .env 中的 LLM_PROVIDER 切换。
 
 Phase 1: 单体 ReACT Agent (create_react_agent)
 Phase 2: + MemorySaver 多轮对话记忆
 Phase 3: 多专家 Supervisor 架构
 """
 
-import json
 import logging
 from typing import Any, Optional
 
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.language_models import BaseChatModel
 from langgraph.prebuilt import create_react_agent
 
 from app.agent.prompts import REACT_SYSTEM_PROMPT
@@ -32,21 +32,47 @@ TOOLS = [analyze_ct_tool, detect_lesion_tool, query_medical_knowledge_tool]
 
 
 # ─────────────────────────────────────────
-# LLM 实例（懒加载）
+# LLM 工厂（根据 LLM_PROVIDER 自动切换）
 # ─────────────────────────────────────────
 
 _llm = None
 
 
-def _get_llm() -> ChatGoogleGenerativeAI:
-    """获取全局 LLM 实例"""
+def _get_llm() -> BaseChatModel:
+    """
+    获取全局 LLM 实例（根据 .env 中的 LLM_PROVIDER 自动选择）
+
+    - google → ChatGoogleGenerativeAI (Gemini)
+    - qwen   → ChatOpenAI (DashScope OpenAI 兼容接口)
+    """
     global _llm
-    if _llm is None:
+    if _llm is not None:
+        return _llm
+
+    provider = settings.llm_provider.lower()
+    logger.info("初始化 LLM 提供商: %s, 模型: %s", provider, settings.active_model_name)
+
+    if provider == "google":
+        from langchain_google_genai import ChatGoogleGenerativeAI
         _llm = ChatGoogleGenerativeAI(
             model=settings.model_name,
             google_api_key=settings.google_api_key,
             temperature=0.3,
         )
+    elif provider == "qwen":
+        from langchain_openai import ChatOpenAI
+        _llm = ChatOpenAI(
+            model=settings.qwen_model_name,
+            api_key=settings.qwen_api_key,
+            base_url=settings.qwen_base_url,
+            temperature=0.3,
+        )
+    else:
+        raise ValueError(
+            f"不支持的 LLM 提供商: {provider}。"
+            f"请在 .env 中设置 LLM_PROVIDER=google 或 LLM_PROVIDER=qwen"
+        )
+
     return _llm
 
 

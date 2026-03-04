@@ -1,8 +1,10 @@
 """
 诊断报告生成器
 
-使用 Google Gemini API 根据CT分析结果生成结构化诊断报告。
+根据CT分析结果生成结构化诊断报告。
+支持多 LLM 提供商（Google Gemini / 通义千问），通过 .env 中的 LLM_PROVIDER 切换。
 """
+
 
 import json
 import logging
@@ -13,6 +15,42 @@ from app.agent.prompts import REPORT_GENERATION_PROMPT
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+def _call_llm(prompt: str) -> str:
+    """
+    调用 LLM 生成文本（根据 LLM_PROVIDER 自动选择提供商）
+
+    参数:
+        prompt: 提示词文本
+
+    返回:
+        LLM 生成的文本
+    """
+    provider = settings.llm_provider.lower()
+
+    if provider == "google":
+        import google.generativeai as genai
+        genai.configure(api_key=settings.google_api_key)
+        model = genai.GenerativeModel(settings.model_name)
+        response = model.generate_content(prompt)
+        return response.text
+
+    elif provider == "qwen":
+        from openai import OpenAI
+        client = OpenAI(
+            api_key=settings.qwen_api_key,
+            base_url=settings.qwen_base_url,
+        )
+        response = client.chat.completions.create(
+            model=settings.qwen_model_name,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+        )
+        return response.choices[0].message.content
+
+    else:
+        raise ValueError(f"不支持的 LLM 提供商: {provider}")
 
 
 def _format_classification_result(result: dict[str, Any]) -> str:
@@ -111,18 +149,14 @@ def generate_diagnosis_report(
         current_date=current_date,
     )
 
-    # 调用 Gemini API 生成报告
-    if settings.google_api_key:
+    # 调用 LLM 生成报告（根据 LLM_PROVIDER 自动选择）
+    if settings.active_api_key:
         try:
-            import google.generativeai as genai
-            genai.configure(api_key=settings.google_api_key)
-            model = genai.GenerativeModel(settings.model_name)
-            response = model.generate_content(prompt)
-            report = response.text
-            logger.info("Gemini 报告生成成功")
+            report = _call_llm(prompt)
+            logger.info("LLM 报告生成成功 (provider=%s)", settings.llm_provider)
             return report
         except Exception as exc:
-            logger.error("Gemini API 调用失败: %s，使用模板生成报告", exc)
+            logger.error("LLM API 调用失败: %s，使用模板生成报告", exc)
 
     # 降级方案：使用模板直接生成报告（无需API）
     disease_type = classification_result.get("disease_type", "未知")

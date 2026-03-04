@@ -1,0 +1,89 @@
+{
+  "patient": {
+    "id": "P-2024-00876",
+    "name": "张三",
+    "gender": "男",
+    "age": 58,
+    "date_of_birth": "1968-05-12",
+    "id_number": "310***********1234",
+    "phone": "138****5678",
+    "blood_type": "A型",
+    "height_cm": 172,
+    "weight_kg": 68,
+    "bmi": 23.0,
+    "allergies": ["青霉素", "磺胺类药物"],
+    "smoking_history": "吸烟30年，已戒烟3年",
+    "drinking_history": "偶尔饮酒",
+    "occupation": "退休教师",
+    "emergency_contact": {
+      "name": "张小明",
+      "relation": "子女",
+      "phone": "139****8765"
+    }
+  },
+  "medical_history": [
+    {
+      "date": "2023-03-15",
+      "type": "门诊",
+      "department": "呼吸内科",
+      "diagnosis": "右肺上叶磨玻璃结节（GGO），6mm",
+      "treatment": "建议3个月后CT随访",
+      "doctor": "李主任"
+    },
+    {
+      "date": "2023-06-20",
+      "type": "随访",
+      "department": "呼吸内科",
+      "diagnosis": "右肺上叶GGO结节，较前无明显变化",
+      "treatment": "继续观察，6个月后复查",
+      "doctor": "李主任"
+    },
+    {
+      "date": "2024-01-10",
+      "type": "体检",
+      "department": "体检中心",
+      "diagnosis": "右肺上叶结节较前略增大（8mm），建议专科就诊",
+      "treatment": "转呼吸内科",
+      "doctor": "体检医师"
+    }
+  ],
+  "recent_symptoms": [
+    "间断性干咳，无痰，约2周",
+    "偶有胸闷，与体力活动相关",
+    "无咯血、发热、盗汗",
+    "体重近3个月无明显变化"
+  ],
+  "recent_lab_results": {
+    "date": "2024-01-12",
+    "items": {
+      "WBC": {"value": 7.2, "unit": "×10⁹/L", "range": "3.5-9.5", "status": "normal"},
+      "RBC": {"value": 4.8, "unit": "×10¹²/L", "range": "4.3-5.8", "status": "normal"},
+      "HGB": {"value": 145, "unit": "g/L", "range": "130-175", "status": "normal"},
+      "PLT": {"value": 220, "unit": "×10⁹/L", "range": "125-350", "status": "normal"},
+      "CRP": {"value": 2.1, "unit": "mg/L", "range": "0-10", "status": "normal"},
+      "CEA": {"value": 4.8, "unit": "ng/mL", "range": "0-5", "status": "borderline"},
+      "NSE": {"value": 16.2, "unit": "ng/mL", "range": "0-16.3", "status": "borderline"},
+      "CYFRA21-1": {"value": 3.8, "unit": "ng/mL", "range": "0-3.3", "status": "high"}
+    }
+  },
+  "historical_reports": [
+    {
+      "date": "2023-03-15",
+      "type": "胸部CT平扫",
+      "summary": "右肺上叶后段可见一枚磨玻璃密度结节影，大小约6×5mm，边缘尚光滑。",
+      "file_name": "CT_2023_03_15.pdf"
+    },
+    {
+      "date": "2023-06-20",
+      "type": "胸部CT平扫",
+      "summary": "右肺上叶后段GGO结节，大小约6×6mm，较前片无明显变化。余肺野清晰。",
+      "file_name": "CT_2023_06_20.pdf"
+    },
+    {
+      "date": "2024-01-10",
+      "type": "胸部CT平扫",
+      "summary": "右肺上叶后段结节，大小约8×7mm，较前增大，内部密度略不均匀，建议进一步检查。",
+      "file_name": "CT_2024_01_10.pdf"
+    }
+  ]
+}
