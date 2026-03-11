@@ -1,24 +1,43 @@
 """
-影像分析 Agent (Mock + 冗余接口)
+影像分析 Agent
 
-读取上传的 2D 图像 / DICOM 序列，进行影像学分析。
-当前 MVP：复用 app/skills 的 mock 分类+检测逻辑。
-
-未来升级：
-    - process_dicom_series(): 接入基于 VTK/ITK 的三维重建管线
-    - generate_3d_reconstruction(): 输出三维体渲染结果
-    - 接入真实 ResNet/EfficientNet CT 分类模型
-    - 接入真实 YOLOv8/nnU-Net 病灶检测模型
+根据用户描述的影像信息进行分析，或对文本描述的CT/MRI等影像学发现进行专业解读。
+调用 LLM（Qwen API）基于用户真实输入进行专业分析。
 """
 
+import json
 import logging
+import os
+import re
 import time
-from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from web.agents.base import AbnormalMetric, AgentStatus, BaseAgentOutput
 
 logger = logging.getLogger(__name__)
+
+IMAGING_SYSTEM_PROMPT = """你是一位经验丰富的影像科医师，负责根据患者提供的影像学描述或检查结果进行专业分析。
+
+请根据用户输入，提取影像相关信息并进行专业分析。以 JSON 格式返回结果，结构如下：
+{
+  "findings": ["发现1", "发现2", "发现3"],
+  "abnormal_metrics": [
+    {
+      "name": "影像指标名称（如 结节大小、CT值）",
+      "value": "测量值",
+      "reference_range": "正常参考范围",
+      "severity": "moderate",
+      "description": "影像学意义说明"
+    }
+  ],
+  "confidence": 0.82,
+  "classification": "影像学诊断印象",
+  "malignancy_probability": "恶性概率估计（如 40-60%）"
+}
+
+severity 只能是 mild、moderate 或 severe 之一。
+只返回 JSON 对象，不要有其他文字。findings 至少提供3条专业影像学分析。
+如果用户输入中包含CT、MRI、X光等影像学描述，请重点分析病灶特征、大小、位置和性质。"""
 
 
 class ImagingAgent:
@@ -26,23 +45,19 @@ class ImagingAgent:
     影像分析 Agent
 
     职责：
-        - 2D CT 图像的疾病分类
-        - 病灶检测与定位
-        - (预留) DICOM 序列三维重建
-
-    参数:
-        simulate_delay: 模拟处理延迟时间（秒）
+        - 根据用户描述的影像学信息进行专业解读
+        - 分析病灶特征（大小、密度、边缘等）
+        - 评估恶性概率并给出随访建议
     """
 
     AGENT_NAME = "ImagingAgent"
     DISPLAY_NAME = "🔬 影像分析"
 
-    def __init__(self, simulate_delay: float = 3.0) -> None:
-        self.simulate_delay = simulate_delay
+    def __init__(self) -> None:
+        pass
 
     def run(
         self,
-        image_path: Optional[str] = None,
         text: str = "",
         *,
         on_status: Any = None,
@@ -51,8 +66,7 @@ class ImagingAgent:
         执行影像分析
 
         参数:
-            image_path: 上传的 CT 图片路径（.jpg/.png/.dcm）
-            text: 附加文本描述
+            text: 用户输入的影像学描述或检查结果
             on_status: 状态回调
 
         返回:
@@ -63,151 +77,96 @@ class ImagingAgent:
             on_status(self.AGENT_NAME, AgentStatus.RUNNING)
 
         start = time.time()
-        time.sleep(self.simulate_delay)
 
-        # ── Mock 影像分析结果 ──
-        has_image = image_path and Path(image_path).exists()
+        qwen_key = os.getenv("QWEN_API_KEY", "")
+        if not qwen_key:
+            elapsed = time.time() - start
+            if on_status:
+                on_status(self.AGENT_NAME, AgentStatus.FAILED)
+            return BaseAgentOutput(
+                agent_name=self.AGENT_NAME,
+                agent_display_name=self.DISPLAY_NAME,
+                status=AgentStatus.FAILED,
+                processing_time=round(elapsed, 2),
+                error_message="LLM 不可用：未配置 QWEN_API_KEY",
+            )
 
-        findings = [
-            "右肺上叶后段可见一枚混合密度结节影，大小约 8×7mm",
-            "结节边缘可见短毛刺征，内部密度不均匀",
-            "结节周围可见轻度磨玻璃晕征（halo sign）",
-            "余肺野清晰，未见实变影或胸腔积液",
-            "纵隔淋巴结未见明显增大（短径 < 10mm）",
-        ]
+        try:
+            from openai import OpenAI
 
-        abnormal_metrics = [
-            AbnormalMetric(
-                name="结节最大径",
-                value="8mm",
-                reference_range="<6mm 低风险",
-                severity="moderate",
-                description="较前次检查增大2mm，需进一步评估",
-            ),
-            AbnormalMetric(
-                name="结节CT值",
-                value="-320 ~ +45 HU",
-                reference_range="纯GGO: <-400HU",
-                severity="moderate",
-                description="混合密度结节，实性成分占比约30%",
-            ),
-        ]
+            client = OpenAI(
+                api_key=qwen_key,
+                base_url=os.getenv(
+                    "QWEN_BASE_URL",
+                    "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                ),
+            )
 
-        elapsed = time.time() - start
-        logger.info("[%s] 影像分析完成 (%.1fs)", self.AGENT_NAME, elapsed)
+            response = client.chat.completions.create(
+                model=os.getenv("QWEN_MODEL_NAME", "qwen-plus"),
+                messages=[
+                    {"role": "system", "content": IMAGING_SYSTEM_PROMPT},
+                    {"role": "user", "content": text},
+                ],
+                temperature=0.3,
+                max_tokens=1500,
+            )
 
-        output = BaseAgentOutput(
-            agent_name=self.AGENT_NAME,
-            agent_display_name=self.DISPLAY_NAME,
-            status=AgentStatus.SUCCESS,
-            findings=findings,
-            abnormal_metrics=abnormal_metrics,
-            confidence=0.85,
-            processing_time=round(elapsed, 2),
-            raw_data={
-                "classification": {
-                    "disease_type": "肺结节",
-                    "confidence": 0.85,
-                    "all_probabilities": {
-                        "肺结节": 0.85,
-                        "肺炎": 0.06,
-                        "正常": 0.04,
-                        "肺癌": 0.03,
-                        "肺气肿": 0.01,
-                        "胸腔积液": 0.01,
-                    },
-                },
-                "detection": {
-                    "lesions": [
-                        {
-                            "lesion_id": 1,
-                            "type": "混合密度结节",
-                            "location": "右侧上叶",
-                            "size_mm": 8.0,
-                            "bounding_box": {"x1": 185, "y1": 120, "x2": 240, "y2": 170},
-                            "confidence": 0.88,
-                        }
-                    ],
-                    "total_count": 1,
-                },
-                "has_uploaded_image": has_image,
-                "image_path": image_path,
-            },
-        )
+            content = response.choices[0].message.content.strip()
+            if content.startswith("```"):
+                match = re.search(r'\{.*\}', content, re.DOTALL)
+                if not match:
+                    raise ValueError(f"无法从 LLM 响应中提取 JSON: {content[:200]}")
+                content = match.group(0)
 
-        if on_status:
-            on_status(self.AGENT_NAME, AgentStatus.SUCCESS)
+            data = json.loads(content)
 
-        return output
-
-    # ──────────────────────────────────────
-    # 未来冗余接口（三维重建管线）
-    # ──────────────────────────────────────
-
-    def process_dicom_series(
-        self,
-        dir_path: str,
-        *,
-        slice_thickness: Optional[float] = None,
-        window_center: int = -600,
-        window_width: int = 1500,
-    ) -> dict[str, Any]:
-        """
-        处理 DICOM 序列文件夹，提取三维体数据
-
-        # TODO: 接入基于 VTK/ITK 的三维重建管线
-        # 实现步骤：
-        #   1. 使用 pydicom 读取 .dcm 文件列表
-        #   2. 基于 SliceLocation / InstanceNumber 排序
-        #   3. 使用 SimpleITK 构建 3D Volume
-        #   4. 应用窗宽窗位 (WL/WW) 进行灰度映射
-        #   5. 使用 VTK 进行 Marching Cubes 面绘制或 Volume Rendering 体绘制
-
-        参数:
-            dir_path: 包含 .dcm 文件的文件夹路径
-            slice_thickness: 层厚（mm），None 则从 DICOM 元数据自动获取
-            window_center: 窗位（HU），默认肺窗 -600
-            window_width: 窗宽（HU），默认肺窗 1500
-
-        返回:
-            dict: {
-                "volume_shape": (D, H, W),
-                "voxel_spacing": (sz, sy, sx),
-                "series_uid": str,
-                "num_slices": int,
-                "reconstruction_path": str  # 三维重建结果文件路径
+            findings = data.get("findings", [])
+            abnormal_metrics = [
+                AbnormalMetric(
+                    name=m.get("name", ""),
+                    value=m.get("value", ""),
+                    reference_range=m.get("reference_range", ""),
+                    severity=m.get("severity", "mild"),
+                    description=m.get("description", ""),
+                )
+                for m in data.get("abnormal_metrics", [])
+            ]
+            confidence = float(data.get("confidence", 0.82))
+            raw_data = {
+                "classification": data.get("classification", ""),
+                "malignancy_probability": data.get("malignancy_probability", ""),
+                "raw_response": data,
             }
-        """
-        raise NotImplementedError(
-            "DICOM 序列处理尚未实现。TODO: 接入基于 VTK/ITK 的三维重建管线"
-        )
 
-    def generate_3d_reconstruction(
-        self,
-        volume_data: Any = None,
-        *,
-        method: str = "volume_rendering",
-        iso_value: float = -300.0,
-        output_format: str = "glb",
-    ) -> str:
-        """
-        根据三维体数据生成三维重建结果
+            elapsed = time.time() - start
+            logger.info("[%s] 影像分析完成 (%.1fs)", self.AGENT_NAME, elapsed)
 
-        # TODO: 接入基于 VTK/ITK 的三维重建管线
-        # 支持的重建方式：
-        #   - "volume_rendering": VTK vtkSmartVolumeMapper 体渲染
-        #   - "surface_rendering": Marching Cubes 面渲染
-        #   - "mip": 最大密度投影 (Maximum Intensity Projection)
+            output = BaseAgentOutput(
+                agent_name=self.AGENT_NAME,
+                agent_display_name=self.DISPLAY_NAME,
+                status=AgentStatus.SUCCESS,
+                findings=findings,
+                abnormal_metrics=abnormal_metrics,
+                confidence=confidence,
+                processing_time=round(elapsed, 2),
+                raw_data=raw_data,
+            )
 
-        参数:
-            volume_data: 三维体数据（numpy ndarray 或 SimpleITK Image）
-            method: 重建方式 ("volume_rendering" / "surface_rendering" / "mip")
-            iso_value: 等值面阈值（HU），用于面渲染
-            output_format: 输出格式 ("glb" / "obj" / "stl" / "png")
+            if on_status:
+                on_status(self.AGENT_NAME, AgentStatus.SUCCESS)
 
-        返回:
-            str: 重建结果文件路径
-        """
-        raise NotImplementedError(
-            "三维重建尚未实现。TODO: 接入基于 VTK 的 Volume Rendering 管线"
-        )
+            return output
+
+        except Exception as exc:
+            elapsed = time.time() - start
+            logger.error("[%s] 分析失败: %s", self.AGENT_NAME, exc)
+            if on_status:
+                on_status(self.AGENT_NAME, AgentStatus.FAILED)
+            return BaseAgentOutput(
+                agent_name=self.AGENT_NAME,
+                agent_display_name=self.DISPLAY_NAME,
+                status=AgentStatus.FAILED,
+                processing_time=round(elapsed, 2),
+                error_message=str(exc),
+            )
