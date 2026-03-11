@@ -1,22 +1,41 @@
 """
-血液检验分析 Agent (Mock)
+血液检验分析 Agent
 
 分析患者血液检验结果，识别异常指标并给出临床提示。
-当前为 Mock 实现，返回预设的异常血液指标数据。
-
-未来升级：
-    - 接入医院 LIS (检验信息系统) 数据接口
-    - 集成自动异常指标解读引擎
-    - 支持趋势分析（多次检验结果对比）
+调用 LLM（Qwen API）基于用户真实输入进行专业分析。
 """
 
+import json
 import logging
+import os
+import re
 import time
-from typing import Any, Optional
+from typing import Any
 
 from web.agents.base import AbnormalMetric, AgentStatus, BaseAgentOutput
 
 logger = logging.getLogger(__name__)
+
+BLOOD_SYSTEM_PROMPT = """你是一位血液检验科医师，负责分析患者提供的血液检验数据，识别异常指标并给出临床提示。
+
+请根据用户输入，提取血液相关检验指标并进行专业分析。以 JSON 格式返回结果，结构如下：
+{
+  "findings": ["发现1", "发现2", "发现3"],
+  "abnormal_metrics": [
+    {
+      "name": "指标名称（如 CEA、CYFRA21-1、WBC）",
+      "value": "指标值（含单位）",
+      "reference_range": "参考范围",
+      "severity": "mild",
+      "description": "临床意义说明"
+    }
+  ],
+  "confidence": 0.80
+}
+
+severity 只能是 mild、moderate 或 severe 之一。
+只返回 JSON 对象，不要有其他文字。findings 至少提供3条专业分析。
+如果用户输入中没有明确的血液指标数据，请根据其描述推断可能的异常并说明。"""
 
 
 class BloodAgent:
@@ -27,22 +46,17 @@ class BloodAgent:
         - 解析血常规、肿瘤标志物、生化指标
         - 标记异常值并给出临床参考意义
         - 辅助鉴别诊断
-
-    参数:
-        simulate_delay: 模拟处理延迟时间（秒）
     """
 
     AGENT_NAME = "BloodAgent"
     DISPLAY_NAME = "🩸 血液分析"
 
-    def __init__(self, simulate_delay: float = 2.0) -> None:
-        self.simulate_delay = simulate_delay
+    def __init__(self) -> None:
+        pass
 
     def run(
         self,
         text: str = "",
-        attachments: Optional[list[str]] = None,
-        patient_profile: Optional[dict[str, Any]] = None,
         *,
         on_status: Any = None,
     ) -> BaseAgentOutput:
@@ -50,9 +64,7 @@ class BloodAgent:
         执行血液检验分析
 
         参数:
-            text: 用户描述或补充信息
-            attachments: 上传的检验报告文件路径列表
-            patient_profile: 患者档案
+            text: 用户描述或血液检验数据
             on_status: 状态回调
 
         返回:
@@ -63,71 +75,91 @@ class BloodAgent:
             on_status(self.AGENT_NAME, AgentStatus.RUNNING)
 
         start = time.time()
-        time.sleep(self.simulate_delay)
 
-        # ── Mock 分析结果 ──
-        findings = [
-            "血常规各项指标（WBC、RBC、HGB、PLT）均在正常范围内",
-            "CRP 2.1 mg/L，感染指标正常，排除急性感染可能",
-            "肿瘤标志物 CYFRA21-1 升高至 3.8 ng/mL（正常 <3.3），提示角蛋白代谢异常",
-            "CEA 4.8 ng/mL 接近临界值（正常 <5.0），建议动态监测",
-            "NSE 16.2 ng/mL 处于正常上限（正常 <16.3），暂无特殊意义",
-        ]
+        qwen_key = os.getenv("QWEN_API_KEY", "")
+        if not qwen_key:
+            elapsed = time.time() - start
+            if on_status:
+                on_status(self.AGENT_NAME, AgentStatus.FAILED)
+            return BaseAgentOutput(
+                agent_name=self.AGENT_NAME,
+                agent_display_name=self.DISPLAY_NAME,
+                status=AgentStatus.FAILED,
+                processing_time=round(elapsed, 2),
+                error_message="LLM 不可用：未配置 QWEN_API_KEY",
+            )
 
-        abnormal_metrics = [
-            AbnormalMetric(
-                name="CYFRA21-1",
-                value="3.8 ng/mL",
-                reference_range="0 - 3.3 ng/mL",
-                severity="moderate",
-                description="细胞角蛋白19片段，升高常见于非小细胞肺癌（鳞癌敏感性较高）",
-            ),
-            AbnormalMetric(
-                name="CEA",
-                value="4.8 ng/mL",
-                reference_range="0 - 5.0 ng/mL",
-                severity="mild",
-                description="癌胚抗原接近上限，腺癌相关标志物，建议2周后复查",
-            ),
-            AbnormalMetric(
-                name="NSE",
-                value="16.2 ng/mL",
-                reference_range="0 - 16.3 ng/mL",
-                severity="mild",
-                description="神经元特异性烯醇化酶，正常上限，排除小细胞肺癌可能性较大",
-            ),
-        ]
+        try:
+            from openai import OpenAI
 
-        elapsed = time.time() - start
-        logger.info("[%s] 血液分析完成 (%.1fs)", self.AGENT_NAME, elapsed)
+            client = OpenAI(
+                api_key=qwen_key,
+                base_url=os.getenv(
+                    "QWEN_BASE_URL",
+                    "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                ),
+            )
 
-        output = BaseAgentOutput(
-            agent_name=self.AGENT_NAME,
-            agent_display_name=self.DISPLAY_NAME,
-            status=AgentStatus.SUCCESS,
-            findings=findings,
-            abnormal_metrics=abnormal_metrics,
-            confidence=0.82,
-            processing_time=round(elapsed, 2),
-            raw_data={
-                "blood_routine": {
-                    "WBC": {"value": 7.2, "status": "normal"},
-                    "RBC": {"value": 4.8, "status": "normal"},
-                    "HGB": {"value": 145, "status": "normal"},
-                    "PLT": {"value": 220, "status": "normal"},
-                },
-                "tumor_markers": {
-                    "CEA": {"value": 4.8, "status": "borderline"},
-                    "NSE": {"value": 16.2, "status": "borderline"},
-                    "CYFRA21-1": {"value": 3.8, "status": "high"},
-                },
-                "infection_markers": {
-                    "CRP": {"value": 2.1, "status": "normal"},
-                },
-            },
-        )
+            response = client.chat.completions.create(
+                model=os.getenv("QWEN_MODEL_NAME", "qwen-plus"),
+                messages=[
+                    {"role": "system", "content": BLOOD_SYSTEM_PROMPT},
+                    {"role": "user", "content": text},
+                ],
+                temperature=0.3,
+                max_tokens=1500,
+            )
 
-        if on_status:
-            on_status(self.AGENT_NAME, AgentStatus.SUCCESS)
+            content = response.choices[0].message.content.strip()
+            if content.startswith("```"):
+                match = re.search(r'\{.*\}', content, re.DOTALL)
+                if not match:
+                    raise ValueError(f"无法从 LLM 响应中提取 JSON: {content[:200]}")
+                content = match.group(0)
 
-        return output
+            data = json.loads(content)
+
+            findings = data.get("findings", [])
+            abnormal_metrics = [
+                AbnormalMetric(
+                    name=m.get("name", ""),
+                    value=m.get("value", ""),
+                    reference_range=m.get("reference_range", ""),
+                    severity=m.get("severity", "mild"),
+                    description=m.get("description", ""),
+                )
+                for m in data.get("abnormal_metrics", [])
+            ]
+            confidence = float(data.get("confidence", 0.80))
+
+            elapsed = time.time() - start
+            logger.info("[%s] 血液分析完成 (%.1fs)", self.AGENT_NAME, elapsed)
+
+            output = BaseAgentOutput(
+                agent_name=self.AGENT_NAME,
+                agent_display_name=self.DISPLAY_NAME,
+                status=AgentStatus.SUCCESS,
+                findings=findings,
+                abnormal_metrics=abnormal_metrics,
+                confidence=confidence,
+                processing_time=round(elapsed, 2),
+                raw_data={"raw_response": data},
+            )
+
+            if on_status:
+                on_status(self.AGENT_NAME, AgentStatus.SUCCESS)
+
+            return output
+
+        except Exception as exc:
+            elapsed = time.time() - start
+            logger.error("[%s] 分析失败: %s", self.AGENT_NAME, exc)
+            if on_status:
+                on_status(self.AGENT_NAME, AgentStatus.FAILED)
+            return BaseAgentOutput(
+                agent_name=self.AGENT_NAME,
+                agent_display_name=self.DISPLAY_NAME,
+                status=AgentStatus.FAILED,
+                processing_time=round(elapsed, 2),
+                error_message=str(exc),
+            )

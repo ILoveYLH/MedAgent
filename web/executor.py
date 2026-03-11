@@ -2,7 +2,7 @@
 并行调度器 (Parallel Executor)
 
 使用 ThreadPoolExecutor 并发调用多个 Agent，
-通过 status_callback 实时通知前端更新状态看板。
+通过 status_callback 实时通知前端更新状态。
 
 Streamlit 运行在同步环境，因此使用线程池而非 asyncio。
 """
@@ -56,9 +56,6 @@ class ParallelExecutor:
             agent_names: 需要运行的 Agent 名称列表
             input_data: 传递给每个 Agent 的输入数据
                 - "text": 用户输入文本
-                - "image_path": 上传的图片路径 (可选)
-                - "attachments": 附件路径列表 (可选)
-                - "patient_profile": 患者档案 (可选)
             status_callback: 状态回调函数 (agent_name, status) -> None
 
         返回:
@@ -86,16 +83,6 @@ class ParallelExecutor:
             try:
                 output = agent.run(
                     text=input_data.get("text", ""),
-                    **(
-                        {"image_path": input_data.get("image_path")}
-                        if agent_name == "ImagingAgent"
-                        else {}
-                    ),
-                    **(
-                        {"patient_profile": input_data.get("patient_profile")}
-                        if agent_name in ("ClinicalAgent", "BloodAgent", "GeneticsAgent")
-                        else {}
-                    ),
                     on_status=status_callback,
                 )
                 return agent_name, output

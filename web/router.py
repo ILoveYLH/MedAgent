@@ -18,7 +18,6 @@
 import json
 import logging
 import os
-from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -88,16 +87,14 @@ DOCUMENT_EXTENSIONS = {".pdf", ".txt", ".doc", ".docx", ".csv", ".xlsx"}
 
 def route_input(
     text: str,
-    attachments: Optional[list[str]] = None,
 ) -> list[str]:
     """
-    根据用户输入文本和附件类型，智能决定需要激活的 Agent 列表
+    根据用户输入文本，智能决定需要激活的 Agent 列表
 
     优先使用 LLM 进行意图识别，失败时降级为关键词匹配。
 
     参数:
         text: 用户输入的文本消息
-        attachments: 上传的文件路径列表
 
     返回:
         list[str]: 需要激活的 Agent 名称列表（去重后）
@@ -111,21 +108,13 @@ def route_input(
         logger.info("LLM 路由不可用，降级为关键词匹配")
         activated = _route_with_keywords(text)
 
-    # ─ 3. 文件类型补充路由 ─
-    if attachments:
-        file_agents = _route_by_file_type(attachments)
-        if file_agents:
-            # 有文件上传 → 移除 GeneralAgent，加入文件相关 Agent
-            activated.discard(GENERAL)
-            activated.update(file_agents)
-
-    # ─ 4. 一致性保障：有专业 Agent 则必加 Clinical ─
+    # ─ 3. 一致性保障：有专业 Agent 则必加 Clinical ─
     has_specialist = any(a in SPECIALIST_AGENTS for a in activated)
     if has_specialist:
         activated.add(CLINICAL)
         activated.discard(GENERAL)  # 有专业需求就不走通用对话
 
-    # ─ 5. 兜底：什么都没匹配到 → GeneralAgent ─
+    # ─ 4. 兜底：什么都没匹配到 → GeneralAgent ─
     if not activated:
         activated.add(GENERAL)
 
