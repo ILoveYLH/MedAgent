@@ -1,26 +1,39 @@
 """
-CT疾病分类 Skill（Mock实现）
+CT疾病分类 Skill
 
-当前使用随机模拟结果，预留真实模型接口。
+支持两种模式：
+  1. 真实模式（MONAI EfficientNet-B4）：有模型权重时自动启用
+  2. Mock 模式：模型不存在时自动降级，用于开发/演示
 
-如何替换为真实模型：
-  1. 安装模型依赖（如 torch, torchvision 或 onnxruntime）
-  2. 在 _load_real_model() 中加载预训练权重
-  3. 在 classify_ct() 中替换 _mock_classify() 调用为真实推理代码
-  4. 真实模型示例：
-     - ResNet50：torchvision.models.resnet50(pretrained=True)
-     - EfficientNet：timm.create_model('efficientnet_b4', pretrained=True)
-     - ONNX模型：onnxruntime.InferenceSession('ct_classifier.onnx')
+如何启用真实分类推理：
+  1. pip install monai
+  2. 将训练好的 EfficientNet-B4 权重放至 models/ct_classifier.pth
+  3. 模型将自动加载并用于推理
+
+肺窗预处理参数（DICOM）：
+  - 窗位 (Window Level, WL) = -600 HU
+  - 窗宽 (Window Width, WW) = 1500 HU
 """
 
 import json
 import logging
+import os
 import random
 from pathlib import Path
+from typing import Any, Optional
 
 from langchain_core.tools import tool
 
 logger = logging.getLogger(__name__)
+
+# ── 模型配置 ──
+_DEFAULT_MODEL_PATHS = [
+    "models/ct_classifier.pth",
+    "models/ct_classifier/model.pth",
+]
+_CT_WINDOW_LEVEL = -600   # 肺窗窗位（HU）
+_CT_WINDOW_WIDTH = 1500   # 肺窗窗宽（HU）
+_IMAGE_SIZE = (224, 224)  # EfficientNet-B4 输入尺寸
 
 # 预定义的疾病分类列表（与真实临床分类对应）
 DISEASE_CLASSES = [
@@ -81,6 +94,8 @@ def classify_ct(image_path: str) -> dict:
     """
     CT疾病分类主函数
 
+    优先尝试 MONAI EfficientNet-B4 真实推理，失败时自动降级为 Mock。
+
     参数:
         image_path: CT图片文件路径（支持 .jpg/.png/.dcm 等格式）
 
@@ -95,14 +110,119 @@ def classify_ct(image_path: str) -> dict:
     """
     logger.info("开始CT分类，图片路径: %s", image_path)
 
-    # 验证输入路径（允许mock模式下路径不存在）
     path = Path(image_path)
-    if not path.exists():
+    if path.exists():
+        # 尝试真实推理
+        real_result = _run_monai_inference(image_path)
+        if real_result is not None:
+            logger.info(
+                "CT分类完成（MONAI）: %s (%.2f%%)",
+                real_result["disease_type"],
+                real_result["confidence"] * 100,
+            )
+            return real_result
+    else:
         logger.warning("图片文件不存在: %s，使用mock数据", image_path)
 
+    # 降级为 Mock
     result = _mock_classify(image_path)
-    logger.info("CT分类完成: %s (置信度: %.2f%%)", result["disease_type"], result["confidence"] * 100)
+    logger.info(
+        "CT分类完成（Mock）: %s (置信度: %.2f%%)",
+        result["disease_type"],
+        result["confidence"] * 100,
+    )
     return result
+
+
+def _find_model_path() -> Optional[Path]:
+    """搜索可用的分类模型权重文件"""
+    project_root = Path(__file__).resolve().parent.parent.parent
+    for rel_path in _DEFAULT_MODEL_PATHS:
+        candidate = Path(rel_path)
+        if not candidate.is_absolute():
+            candidate = project_root / rel_path
+        if candidate.exists():
+            logger.info("[CT分类] 找到模型: %s", candidate)
+            return candidate
+    logger.debug("[CT分类] 未找到模型权重，将使用 Mock")
+    return None
+
+
+def _detect_device() -> str:
+    """自动检测可用的推理设备"""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda"
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"
+    except ImportError:
+        pass
+    return "cpu"
+
+
+def _run_monai_inference(image_path: str) -> Optional[dict]:
+    """使用 MONAI EfficientNet-B4 进行真实推理，失败时返回 None"""
+    model_path = _find_model_path()
+    if model_path is None:
+        return None
+
+    try:
+        import numpy as np
+        import torch
+        from monai.networks.nets import EfficientNetBN
+        from PIL import Image as PILImage
+    except ImportError:
+        logger.debug("monai/PIL 未安装，跳过真实推理")
+        return None
+
+    try:
+        device = torch.device(_detect_device())
+        model = EfficientNetBN(
+            "efficientnet-b4",
+            pretrained=False,
+            num_classes=len(DISEASE_CLASSES),
+        )
+        state = torch.load(str(model_path), map_location=device, weights_only=True)
+        model.load_state_dict(state)
+        model.to(device)
+        model.eval()
+
+        # 预处理图像（应用肺窗）
+        img = PILImage.open(image_path).convert("L")
+        img = img.resize(_IMAGE_SIZE)
+        arr = np.array(img, dtype=np.float32)
+
+        # 肺窗归一化 (HU → 0-1)
+        wl, ww = _CT_WINDOW_LEVEL, _CT_WINDOW_WIDTH
+        lower = wl - ww / 2
+        upper = wl + ww / 2
+        arr = np.clip(arr, lower, upper)
+        arr = (arr - lower) / (upper - lower)
+
+        # 构造 3 通道输入
+        arr = np.stack([arr, arr, arr], axis=0)[np.newaxis]  # (1, 3, H, W)
+        tensor = torch.from_numpy(arr).to(device)
+
+        with torch.no_grad():
+            logits = model(tensor)
+            probs = torch.softmax(logits, dim=1).squeeze().cpu().numpy()
+
+        best_idx = int(np.argmax(probs))
+        all_probs = {cls: float(probs[i]) for i, cls in enumerate(DISEASE_CLASSES)}
+
+        return {
+            "disease_type": DISEASE_CLASSES[best_idx],
+            "confidence": float(probs[best_idx]),
+            "all_probabilities": all_probs,
+            "model_version": f"efficientnet-b4-{model_path.stem}",
+            "image_path": image_path,
+            "is_mock": False,
+        }
+
+    except Exception as exc:
+        logger.warning("[CT分类] MONAI 推理失败: %s", exc)
+        return None
 
 
 # ─────────────────────────────────────────
@@ -121,7 +241,18 @@ def analyze_ct_tool(image_path: str) -> str:
         image_path: CT图片在本地磁盘上的文件路径，比如 /tmp/ct_scan.jpg
     """
     result = classify_ct(image_path)
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    data = json.loads(json.dumps(result, ensure_ascii=False))
+    lines = [
+        "CT分类结果：",
+        f"疾病类型：{data['disease_type']}",
+        f"置信度：{data['confidence']:.2%}",
+        "各类别概率：",
+    ]
+    for disease, prob in data.get("all_probabilities", {}).items():
+        lines.append(f"  {disease}: {prob:.2%}")
+    lines.append(f"模型版本：{data.get('model_version', 'unknown')}")
+    lines.append(f"是否Mock：{data.get('is_mock', True)}")
+    return "\n".join(lines)
 
 
 # 保留旧名称兼容（别名）

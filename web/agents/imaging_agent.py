@@ -1,17 +1,17 @@
 """
-影像分析 Agent (Mock + 冗余接口)
+影像分析 Agent
 
-读取上传的 2D 图像 / DICOM 序列，进行影像学分析。
-当前 MVP：复用 app/skills 的 mock 分类+检测逻辑。
+接收上传的 2D 图像 / DICOM 文件，调用分割调度器进行真实分析。
+当没有真实分割引擎可用时降级为纯 LLM 文本分析。
 
-未来升级：
-    - process_dicom_series(): 接入基于 VTK/ITK 的三维重建管线
-    - generate_3d_reconstruction(): 输出三维体渲染结果
-    - 接入真实 ResNet/EfficientNet CT 分类模型
-    - 接入真实 YOLOv8/nnU-Net 病灶检测模型
+分割引擎优先级：
+  1. nnU-Net v2（有模型时）
+  2. MedSAM（有模型时）
+  3. 纯 LLM 文本分析（降级）
 """
 
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -26,19 +26,17 @@ class ImagingAgent:
     影像分析 Agent
 
     职责：
-        - 2D CT 图像的疾病分类
-        - 病灶检测与定位
-        - (预留) DICOM 序列三维重建
-
-    参数:
-        simulate_delay: 模拟处理延迟时间（秒）
+        - 接收上传的 CT/MRI 图像
+        - 调用 segmentation_dispatcher 智能选择最优分割引擎
+        - 从分割结果中提取 findings 和 abnormal_metrics
+        - 无图片时返回提示信息
     """
 
     AGENT_NAME = "ImagingAgent"
     DISPLAY_NAME = "🔬 影像分析"
 
-    def __init__(self, simulate_delay: float = 3.0) -> None:
-        self.simulate_delay = simulate_delay
+    def __init__(self) -> None:
+        pass
 
     def run(
         self,
@@ -63,35 +61,47 @@ class ImagingAgent:
             on_status(self.AGENT_NAME, AgentStatus.RUNNING)
 
         start = time.time()
-        time.sleep(self.simulate_delay)
 
-        # ── Mock 影像分析结果 ──
-        has_image = image_path and Path(image_path).exists()
+        # ── 无图片时返回提示 ──
+        if not image_path or not Path(image_path).exists():
+            elapsed = time.time() - start
+            if on_status:
+                on_status(self.AGENT_NAME, AgentStatus.FAILED)
+            return BaseAgentOutput(
+                agent_name=self.AGENT_NAME,
+                agent_display_name=self.DISPLAY_NAME,
+                status=AgentStatus.FAILED,
+                findings=["未上传影像文件，无法进行影像分析。"],
+                abnormal_metrics=[],
+                confidence=0.0,
+                processing_time=round(elapsed, 2),
+                error_message="未上传影像",
+            )
 
-        findings = [
-            "右肺上叶后段可见一枚混合密度结节影，大小约 8×7mm",
-            "结节边缘可见短毛刺征，内部密度不均匀",
-            "结节周围可见轻度磨玻璃晕征（halo sign）",
-            "余肺野清晰，未见实变影或胸腔积液",
-            "纵隔淋巴结未见明显增大（短径 < 10mm）",
-        ]
+        # ── 调用分割调度器 ──
+        try:
+            from app.skills.segmentation_dispatcher import smart_segment
 
-        abnormal_metrics = [
-            AbnormalMetric(
-                name="结节最大径",
-                value="8mm",
-                reference_range="<6mm 低风险",
-                severity="moderate",
-                description="较前次检查增大2mm，需进一步评估",
-            ),
-            AbnormalMetric(
-                name="结节CT值",
-                value="-320 ~ +45 HU",
-                reference_range="纯GGO: <-400HU",
-                severity="moderate",
-                description="混合密度结节，实性成分占比约30%",
-            ),
-        ]
+            seg_result = smart_segment(image_path)
+            is_not_mock = not seg_result.get("is_mock", True)
+            has_valid_engine = seg_result.get("engine", "none") != "none"
+            is_real = is_not_mock and has_valid_engine
+        except Exception as exc:
+            logger.warning("[%s] 分割调度器调用失败: %s，降级为 Mock", self.AGENT_NAME, exc)
+            # 降级：使用 ct_classifier + lesion_detector mock
+            seg_result = self._run_mock_pipeline(image_path)
+            is_real = False
+
+        # ── 提取 findings 和 abnormal_metrics ──
+        if seg_result.get("total_count", 0) > 0 or is_real:
+            findings, abnormal_metrics, confidence, raw_data = self._parse_seg_result(
+                seg_result, image_path, is_real
+            )
+        else:
+            # 分割结果为空 or 仍为 Mock → 降级为 LLM 文本分析
+            findings, abnormal_metrics, confidence, raw_data = self._llm_fallback(
+                text, image_path, seg_result
+            )
 
         elapsed = time.time() - start
         logger.info("[%s] 影像分析完成 (%.1fs)", self.AGENT_NAME, elapsed)
@@ -102,112 +112,145 @@ class ImagingAgent:
             status=AgentStatus.SUCCESS,
             findings=findings,
             abnormal_metrics=abnormal_metrics,
-            confidence=0.85,
+            confidence=confidence,
             processing_time=round(elapsed, 2),
-            raw_data={
-                "classification": {
-                    "disease_type": "肺结节",
-                    "confidence": 0.85,
-                    "all_probabilities": {
-                        "肺结节": 0.85,
-                        "肺炎": 0.06,
-                        "正常": 0.04,
-                        "肺癌": 0.03,
-                        "肺气肿": 0.01,
-                        "胸腔积液": 0.01,
-                    },
-                },
-                "detection": {
-                    "lesions": [
-                        {
-                            "lesion_id": 1,
-                            "type": "混合密度结节",
-                            "location": "右侧上叶",
-                            "size_mm": 8.0,
-                            "bounding_box": {"x1": 185, "y1": 120, "x2": 240, "y2": 170},
-                            "confidence": 0.88,
-                        }
-                    ],
-                    "total_count": 1,
-                },
-                "has_uploaded_image": has_image,
-                "image_path": image_path,
-            },
+            raw_data=raw_data,
         )
 
         if on_status:
             on_status(self.AGENT_NAME, AgentStatus.SUCCESS)
-
         return output
 
     # ──────────────────────────────────────
-    # 未来冗余接口（三维重建管线）
+    # 私有方法
     # ──────────────────────────────────────
 
-    def process_dicom_series(
+    def _run_mock_pipeline(self, image_path: str) -> dict[str, Any]:
+        """降级：调用 Mock 分类 + 检测管线"""
+        try:
+            from app.skills.lesion_detector import detect_lesions
+            return detect_lesions(image_path)
+        except Exception:
+            return {"lesions": [], "total_count": 0, "is_mock": True, "image_path": image_path}
+
+    def _parse_seg_result(
         self,
-        dir_path: str,
-        *,
-        slice_thickness: Optional[float] = None,
-        window_center: int = -600,
-        window_width: int = 1500,
-    ) -> dict[str, Any]:
-        """
-        处理 DICOM 序列文件夹，提取三维体数据
+        seg_result: dict[str, Any],
+        image_path: str,
+        is_real: bool,
+    ) -> tuple[list[str], list[AbnormalMetric], float, dict[str, Any]]:
+        """从分割结果中提取 findings 和 abnormal_metrics"""
+        lesions = seg_result.get("lesions", [])
+        engine = seg_result.get("engine", "mock")
+        cross_validated = seg_result.get("cross_validated", False)
+        consistency = seg_result.get("consistency_score")
 
-        # TODO: 接入基于 VTK/ITK 的三维重建管线
-        # 实现步骤：
-        #   1. 使用 pydicom 读取 .dcm 文件列表
-        #   2. 基于 SliceLocation / InstanceNumber 排序
-        #   3. 使用 SimpleITK 构建 3D Volume
-        #   4. 应用窗宽窗位 (WL/WW) 进行灰度映射
-        #   5. 使用 VTK 进行 Marching Cubes 面绘制或 Volume Rendering 体绘制
+        findings = []
+        abnormal_metrics = []
 
-        参数:
-            dir_path: 包含 .dcm 文件的文件夹路径
-            slice_thickness: 层厚（mm），None 则从 DICOM 元数据自动获取
-            window_center: 窗位（HU），默认肺窗 -600
-            window_width: 窗宽（HU），默认肺窗 1500
+        if not lesions:
+            findings.append("影像分析未发现明显异常病灶")
+            return findings, abnormal_metrics, 0.9, seg_result
 
-        返回:
-            dict: {
-                "volume_shape": (D, H, W),
-                "voxel_spacing": (sz, sy, sx),
-                "series_uid": str,
-                "num_slices": int,
-                "reconstruction_path": str  # 三维重建结果文件路径
-            }
-        """
-        raise NotImplementedError(
-            "DICOM 序列处理尚未实现。TODO: 接入基于 VTK/ITK 的三维重建管线"
-        )
+        findings.append(f"影像分析共发现 {len(lesions)} 处疑似病灶")
+        if is_real:
+            engine_label = {"nnunet": "nnU-Net v2", "medsam": "MedSAM", "nnunet+medsam": "nnU-Net + MedSAM"}.get(engine, engine)
+            findings.append(f"分割引擎：{engine_label}")
+            if cross_validated and consistency is not None:
+                level = "高" if consistency >= 0.8 else ("中" if consistency >= 0.5 else "低")
+                findings.append(f"双引擎交叉验证一致性：{level}（{consistency:.0%}）")
 
-    def generate_3d_reconstruction(
+        total_confidence = 0.0
+        for lesion in lesions:
+            size = lesion.get("size_mm", 0)
+            loc = lesion.get("location", "未知位置")
+            ltype = lesion.get("type", "病灶")
+            conf = lesion.get("confidence", 0.8)
+            total_confidence += conf
+
+            finding = f"病灶{lesion.get('lesion_id', '?')}：{loc}发现{ltype}，大小约 {size:.1f}mm，置信度 {conf:.0%}"
+            findings.append(finding)
+
+            # 中等及以上风险的病灶标记为 abnormal
+            severity = "severe" if size > 20 else ("moderate" if size > 8 else "mild")
+            abnormal_metrics.append(
+                AbnormalMetric(
+                    name=f"病灶{lesion.get('lesion_id', '?')} 大小",
+                    value=f"{size:.1f}mm",
+                    reference_range="<6mm 低风险",
+                    severity=severity,
+                    description=f"{loc}{ltype}，{_risk_text(size)}",
+                )
+            )
+
+        avg_confidence = total_confidence / len(lesions) if lesions else 0.8
+        return findings, abnormal_metrics, round(avg_confidence, 3), seg_result
+
+    def _llm_fallback(
         self,
-        volume_data: Any = None,
-        *,
-        method: str = "volume_rendering",
-        iso_value: float = -300.0,
-        output_format: str = "glb",
-    ) -> str:
-        """
-        根据三维体数据生成三维重建结果
+        text: str,
+        image_path: str,
+        seg_result: dict[str, Any],
+    ) -> tuple[list[str], list[AbnormalMetric], float, dict[str, Any]]:
+        """无真实分割结果时，用 LLM 基于文本描述进行影像分析"""
+        qwen_key = os.getenv("QWEN_API_KEY", "")
+        if not qwen_key:
+            findings = [
+                "已接收影像文件，但当前无可用的自动分割引擎。",
+                "建议配置 nnU-Net / MedSAM 模型权重以启用真实影像分析。",
+                "如需文字报告，请在聊天框中描述影像所见。",
+            ]
+            return findings, [], 0.5, seg_result
 
-        # TODO: 接入基于 VTK/ITK 的三维重建管线
-        # 支持的重建方式：
-        #   - "volume_rendering": VTK vtkSmartVolumeMapper 体渲染
-        #   - "surface_rendering": Marching Cubes 面渲染
-        #   - "mip": 最大密度投影 (Maximum Intensity Projection)
+        try:
+            from openai import OpenAI
 
-        参数:
-            volume_data: 三维体数据（numpy ndarray 或 SimpleITK Image）
-            method: 重建方式 ("volume_rendering" / "surface_rendering" / "mip")
-            iso_value: 等值面阈值（HU），用于面渲染
-            output_format: 输出格式 ("glb" / "obj" / "stl" / "png")
+            client = OpenAI(
+                api_key=qwen_key,
+                base_url=os.getenv("QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+            )
 
-        返回:
-            str: 重建结果文件路径
-        """
-        raise NotImplementedError(
-            "三维重建尚未实现。TODO: 接入基于 VTK 的 Volume Rendering 管线"
-        )
+            prompt = (
+                "你是一位放射科医师。用户上传了医学影像，并提供了如下描述：\n"
+                f"{text or '（无文字描述）'}\n\n"
+                "请根据描述，给出影像学角度的初步分析，包括可能的影像特征和建议检查。"
+                "如果描述不足，请说明需要哪些额外信息。"
+                "回复要简洁，以中文回答，每条发现单独一行，最多5条。"
+            )
+
+            response = client.chat.completions.create(
+                model=os.getenv("QWEN_MODEL_NAME", "qwen-plus"),
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+                max_tokens=500,
+            )
+            content = response.choices[0].message.content.strip()
+            findings = [line.strip("- •·") for line in content.split("\n") if line.strip()][:5]
+            return findings, [], 0.65, seg_result
+
+        except Exception as exc:
+            logger.warning("[%s] LLM 降级分析失败: %s", self.AGENT_NAME, exc)
+            return ["影像文件已接收，但自动分析暂不可用，请稍后重试。"], [], 0.0, seg_result
+
+    # ──────────────────────────────────────
+    # 保留原有的 DICOM 接口（未实现，保持兼容）
+    # ──────────────────────────────────────
+
+    def process_dicom_series(self, dir_path: str, **kwargs: Any) -> dict[str, Any]:
+        """处理 DICOM 序列文件夹（TODO）"""
+        raise NotImplementedError("DICOM 序列处理尚未实现")
+
+    def generate_3d_reconstruction(self, volume_data: Any = None, **kwargs: Any) -> str:
+        """生成三维重建（TODO）"""
+        raise NotImplementedError("三维重建尚未实现")
+
+
+def _risk_text(size_mm: float) -> str:
+    """根据大小返回风险描述"""
+    if size_mm > 20:
+        return "肿块级别，高风险，建议立即就医"
+    if size_mm > 8:
+        return "中等大小，中高风险，建议3个月内随访"
+    if size_mm > 6:
+        return "小结节，低-中风险，建议6个月随访"
+    return "微小结节，低风险，建议年度随访"

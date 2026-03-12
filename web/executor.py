@@ -1,8 +1,7 @@
 """
 并行调度器 (Parallel Executor)
 
-使用 ThreadPoolExecutor 并发调用多个 Agent，
-通过 status_callback 实时通知前端更新状态看板。
+使用 ThreadPoolExecutor 并发调用多个 Agent。
 
 Streamlit 运行在同步环境，因此使用线程池而非 asyncio。
 """
@@ -11,22 +10,18 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Optional
 
+from web.agents.analysis_agent import AnalysisAgent
 from web.agents.base import AgentStatus, BaseAgentOutput
-from web.agents.blood_agent import BloodAgent
-from web.agents.clinical_agent import ClinicalAgent
 from web.agents.general_agent import GeneralAgent
-from web.agents.genetics_agent import GeneticsAgent
 from web.agents.imaging_agent import ImagingAgent
 
 logger = logging.getLogger(__name__)
 
-# ── Agent 注册表 ──
+# ── Agent 注册表（3 个 Agent）──
 AGENT_REGISTRY: dict[str, type] = {
     "GeneralAgent": GeneralAgent,
-    "ClinicalAgent": ClinicalAgent,
     "ImagingAgent": ImagingAgent,
-    "BloodAgent": BloodAgent,
-    "GeneticsAgent": GeneticsAgent,
+    "AnalysisAgent": AnalysisAgent,
 }
 
 
@@ -34,7 +29,7 @@ class ParallelExecutor:
     """
     多 Agent 并行调度器
 
-    使用线程池并发运行多个 Agent，收集结果并实时推送状态更新。
+    使用线程池并发运行多个 Agent，收集结果。
 
     参数:
         max_workers: 最大并发线程数
@@ -56,9 +51,7 @@ class ParallelExecutor:
             agent_names: 需要运行的 Agent 名称列表
             input_data: 传递给每个 Agent 的输入数据
                 - "text": 用户输入文本
-                - "image_path": 上传的图片路径 (可选)
-                - "attachments": 附件路径列表 (可选)
-                - "patient_profile": 患者档案 (可选)
+                - "image_path": 上传的图片路径（ImagingAgent 使用）
             status_callback: 状态回调函数 (agent_name, status) -> None
 
         返回:
@@ -66,7 +59,6 @@ class ParallelExecutor:
         """
         results: dict[str, BaseAgentOutput] = {}
 
-        # 初始化所有 Agent 状态为 IDLE
         if status_callback:
             for name in agent_names:
                 status_callback(name, AgentStatus.IDLE)
@@ -84,20 +76,11 @@ class ParallelExecutor:
 
             agent = agent_cls()
             try:
-                output = agent.run(
-                    text=input_data.get("text", ""),
-                    **(
-                        {"image_path": input_data.get("image_path")}
-                        if agent_name == "ImagingAgent"
-                        else {}
-                    ),
-                    **(
-                        {"patient_profile": input_data.get("patient_profile")}
-                        if agent_name in ("ClinicalAgent", "BloodAgent", "GeneticsAgent")
-                        else {}
-                    ),
-                    on_status=status_callback,
-                )
+                kwargs: dict[str, Any] = {"text": input_data.get("text", "")}
+                if agent_name == "ImagingAgent":
+                    kwargs["image_path"] = input_data.get("image_path")
+
+                output = agent.run(**kwargs, on_status=status_callback)
                 return agent_name, output
             except Exception as exc:
                 logger.error("[%s] 运行失败: %s", agent_name, exc)
